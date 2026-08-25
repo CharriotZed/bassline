@@ -1,0 +1,161 @@
+---
+name: czgts-publish
+description: Use when the user wants to auto-post, batch-publish, or draft articles to CSDN (or other self-media accounts) through the 创作罐头 / Muse (czgts) desktop app — driving its logged-in webview accounts via CDP instead of clicking the GUI. Triggers include 创作罐头, czgts, 批量发文, 自动发文, 多账号发布, CSDN 发文.
+---
+
+# 创作罐头 (czgts) 自动发文
+
+## Overview
+「创作罐头」(Muse 出品, `C:\Program Files (x86)\Muse\创作罐头\`, 内核域名 `www.czgts.cn`) 是 Electron 套壳应用, 运行时开着 Chrome DevTools 调试端口。可用 CDP 脚本连上**正在运行的实例**, 复用它里面已登录的 CSDN 账号会话直接发文 —— 不碰登录、不模拟鼠标点像素。
+
+核心洞察: 每个登录的 CSDN 账号是一个 `type=webview` target。**Playwright 的 `connectOverCDP` 看不到 webview**(只暴露 `type=page`), 必须用原始 WebSocket 直连 target 的 `webSocketDebuggerUrl`。
+
+## When to Use
+- 用户想通过创作罐头批量/自动发文章到 CSDN
+- 用户要多账号群发或各账号发不同内容
+- 用户说"替我发""帮我发到 CSDN""批量发"并提到这个软件
+
+**前提**: 创作罐头需运行且调试端口可达。**软件没开不用让用户手动开** —— 先调 `ensureRunning()` 自动拉起(见下方"自动启动")。软件关着直接连会 `fetch failed`。
+
+## The Critical Pitfall (排版会糊掉)
+
+CSDN Markdown 编辑器是 **cledit** (`PRE.editor__inner[contenteditable]` + `DIV.cledit-section` 子节点)。
+
+**绝不能用 `document.execCommand('insertText')` 写正文** —— contenteditable 会把段落间空行 `\n\n` 全部折叠掉(实测 53 个空行→0 个), 整篇 Markdown 糊成一坨, 标题/代码块/表格全失效。
+
+**唯一正确写法: 合成 paste 事件** (`ClipboardEvent` + `DataTransfer` 设 `text/plain`, dispatch 给 `.editor__inner`)。cledit 的粘贴处理会原样保留空行。且 cledit **无视程序构造的 DOM 选区和 execCommand**(全选/清空/Ctrl+A 都不生效, paste 只会在它自己光标处追加导致内容累加变脏)—— 所以**永远在干净的新建页 `/md/?not_checkout=1` 上一次性 paste**, 不要试图清空旧草稿重填。
+
+`czgts.js` 的 `fillArticle()` 已封装正确写法, 直接用。
+
+## The Critical Pitfall #2 (脚手架泄漏 = 封号风险)
+
+SoloChorus 等生成器的原文常带 **AI 脚手架字段**:开头的"建议标题/备选标题（3个备选）"标题列表、"前置答案块/TL;DR"这类标签行、正文里的 `## H2：xxx` 前缀。**这些字段一旦随正文发出去,会被 CSDN 判定为 AI 垃圾内容,有封号风险**(2026-08-23 抖音篇实测泄漏"备选标题""前置答案块（TL;DR）"公开可见)。
+
+脆弱写法(已废弃):按"文件顶部 + `---` 分隔线"切割 —— deepseek 至少 4 种脚手架形态(`# 建议标题`/`## 备选标题`/`## 1.建议标题`/**真标题在前、备选标题埋在后、全篇无 `---`**),位置假设一破就整块泄漏。
+
+**唯一正确写法: 发布前必过 `clean-article.js`**:
+- `cleanArticle(rawMd, title)` —— 按**模式**在任意位置删标题列表块、剥答案块/TL;DR 标签(保留正文)、去 `H2：` 前缀,返回可发布正文。
+- `assertClean(body)` —— 硬门禁,扫残留脚手架,命中即 `{clean:false, hits}`,**拒发**。已焊进 `fillArticle()`(带脚手架的正文无法进编辑器,会抛错)。
+
+## Workflow
+
+引擎在 `czgts.js`(依赖同目录 `cdp.js` + `ws`, 已 npm install)。所有函数经真实发文验证。
+
+```js
+const z = require('./czgts');
+
+// 0. 确保软件在运行(没开会自动拉起)。返回后 port 一定可用
+const run = await z.ensureRunning();             // {running, port, launched}
+if (!run.running) throw new Error('创作罐头启动失败');
+const port = run.port;                           // 别用 readPort(),端口每次重启会变
+
+// 1. 列出账号 —— 务必先做! webview顺序≠你以为的账号顺序, 别发错号
+const accts = await z.listAccounts(port);
+// [{targetId, url, title, account:'2601_xxxx', nick}]
+
+// 2. 连到目标账号的 webview
+const c = await z.connectPage(port, accts[0].targetId);
+
+// 2.5 清洗脚手架(必做,防封号) —— 见 "Critical Pitfall #2"
+const { cleanArticle, assertClean } = require('./clean-article');
+const body = cleanArticle(rawMarkdown, title);   // 删标题列表/答案块标签/H2:前缀
+if (!assertClean(body).clean) throw new Error('脚手架残留,拒发');
+
+// 3. 开新建草稿页 → 填标题+正文(paste保排版)。openNewDraft 用 Page.navigate 完全可行(见下)
+await z.openNewDraft(c);
+const r = await z.fillArticle(c, title, body);   // fillArticle 内置 assertClean 二次保险
+if (!r.ok) throw new Error('排版校验未过: ' + JSON.stringify(r));
+
+// 4. 发布(仅在用户明确授权后!)。**跳过 saveDraft,直接 publish**——见下方"存草稿键盘失效"。
+//    发布前先记录已有 success URL 集合,publish 只认"新出现"的 creation/success/{aid} 页。
+//    带封面时:openPublishPanel → setCover → publish(复用已开面板)
+const before = new Set((await (await fetch(`http://127.0.0.1:${port}/json/list`)).json())
+  .filter(t => /creation\/success\//.test(t.url)).map(t => t.url));
+await z.openPublishPanel(c);
+// await z.setCover(c, coverAbsPath);            // 可选封面
+const p = await z.publish(c, port);              // publish 内部点红色按钮; 也可自己抓 before 外的新 success URL 提 aid
+// aid 从新 success URL 提取: /creation\/success\/(\d+)/
+
+// 5. 记录到本地CSV(用管理后台"已发布"tab 核实, 别只信 success URL/HTTP200)
+// z.recordArticle({ account, title, articleId: aid, url: z.publicUrl(account, aid) });
+
+z.closePage(c);
+```
+
+**发布前务必校验当前 webview 账号**(`cookie UserName === 目标账号`),webview 顺序会变,不校验会发错号。
+
+### 自动启动 (#1)
+`ensureRunning()` 已封装,端口不可达时自动拉起软件。**正确启动方式 = `explorer.exe <主exe绝对路径>`**(走 shell 语义 = 等同双击),实测端口约 2 秒就绪。两个踩过的坑:
+- **直接 spawn/Start-Process 主 exe 会立即自杀** —— `创作罐头.exe` 是 Electron stub,裸启动拿不到 shell 上下文就退出,不开调试端口。必须走 explorer。
+- **别依赖桌面快捷方式** —— 桌面上可能根本没有那个 lnk。用 `findMainExe()` 动态定位:`Muse/<应用名>/<版本>/<应用名>.exe`(basename==应用目录名,排除 updater/crash 等辅助 exe)。
+- 定位路径用 Node 的 fs(UTF-8 可靠);**别在 `node -e` 里写中文/反斜杠路径**,bash+node 双层转义会毁掉它,写成独立 .js 文件。
+
+### 封面 (AI 自动生成)
+生图复用现成脚本 `video-workflow-builder/scripts/generate_cover.py`(走 B站网关 gpt-image-2, key 在该 skill 的 .env):
+```bash
+python scripts/generate_cover.py --platform baijiahao --prompt "文章主题的画面描述,极简科技风,无文字" --output cover.png
+```
+`baijiahao`=1024x768 横版,最接近 CSDN 封面比例。生成后用 `setCover()` 喂给发布面板。
+
+### 过审/存活核实 + 记录 (#3 #4)
+判断一篇文章"是否真正公开存活",有三个已踩过的判据陷阱,和一个验证有效的正确姿势:
+
+**❌ 三个陷阱(别用):**
+1. **登录态 fetch 全是假 200** —— 在软件的登录 webview 里 fetch 自己文章(旧 `checkAudit`),作者 session 连**草稿**和**被判违规**的文章都能返 200+标题。分不清死活。
+2. **只看 HTTP 状态不够** —— 要看渲染后的正文,不是状态码。
+3. **裸 fetch 高频 → CSDN 返 521**(Cloudflare 限流),**521 ≠ 文章死**,只是被挡了。实测第一次过、之后全 521;误判成死亡就是又一次"假阴性"。
+
+**✅ 正确姿势(`czgts-auto/verify-anon2.js` 实测有效):**
+- **匿名访客视角**:直接用 **Node `fetch`**(天然不带 CSDN cookie = 真实访客),**不要**用登录 webview。
+- **加完整浏览器头**:`User-Agent` + `Accept-Language` + `Referer:https://www.csdn.net/` + `sec-ch-ua`,否则易被反爬。
+- **每篇间隔 6-15 秒**:CSDN 文章页是 SSR,正文 `#content_views` 直接在 HTML 里。慢速请求避 521。
+- **判活判据**:`HTTP 200 && HTML 含 id="content_views" && 正文纯文本 > 200 字 && 无"审核中/审核未通过"字样`。**判死**:`404` 或含"文章不存在/审核未通过"(实测被判违规的文章会变 404 下架)。
+- 遇 521 别当死亡 → 拉大间隔(15s)重测那几篇。
+
+- `recordArticle()` 默认写 `%USERPROFILE%\czgts-published.csv`(可用 `CZGTS_CSV` 环境变量覆盖;字段=时间/账号/标题/公开链接/文章ID,按 articleId 幂等去重)。CSV 是"发布流水"≠"存活清单",核实后应补一列真实状态(正常公开/已下架)。
+- 定期核实: 用 `CronCreate` 跑 `verify-anon2.js` 全量匿名核对。
+
+## Quick Reference
+
+| 元素 | 选择器 / 判据 |
+|------|--------------|
+| 启动软件 | `ensureRunning()` → `explorer.exe <主exe路径>`(非 spawn) |
+| 主 exe 定位 | `Muse/<应用名>/<版本>/<应用名>.exe`, basename==目录名 |
+| 调试端口 | `%AppData%\创作罐头\DevToolsActivePort` 第一行, 动态读 |
+| CSDN 账号 target | `type=webview`, url 含 `csdn` |
+| 当前账号 | cookie `UserName` / `UserNick` |
+| 标题框 | `input[placeholder*="标题"]`, 原生 setter 填 |
+| 正文编辑器 | `.editor__inner`, **paste 写入** |
+| 新建空草稿 | 导航 `editor.csdn.net/md/?not_checkout=1` |
+| 存草稿(慎用) | Ctrl+S 靠键盘事件, webview 非焦点时收不到→常失败。**优先跳过, 填完直接 publish** |
+| 开新草稿判据 | `hasEd && hasTitle && len>=1`, **绝不看 ce**(cledit 长期 ce=false, fill 会自己置 true) |
+| 脚手架清洗 | 发布前必过 `cleanArticle()`+`assertClean()`, 防"建议/备选标题、前置答案块、TL;DR"泄漏→封号 |
+| 发布面板 | 点 `button.btn-publish` |
+| 发布确认 | 面板内红色 `button.btn-b-red` (文字"发布文章") |
+| **发布成功判据(权威)** | 读管理后台 `mp_blog/manage/article`, 文章进"已发布"tab。**别只信 success URL/HTTP 200** |
+| 文章标签 | 必填; chip 带删除叉=已选中(非推荐待选); 没自动带就点"添加文章标签"手输+回车 |
+| **每日发文上限(平台配额)** | CSDN=每账号每天 2 篇, 发满后发布被静默拒绝。这是**平台规则非工具限制**——其他平台(抖音/B站/百家号等)各有配额, 发前按平台查 |
+| 账号切前台 | 点主界面(czgts.cn)账号标签(手机号 chip), 非 CDP activateTarget |
+
+## Common Mistakes
+
+- **用 execCommand insertText 写正文** → 空行折叠, 排版全毁。永远用 paste。
+- **在旧草稿上清空重填** → cledit 无视程序选区, 内容会累加变脏。永远开新建页。
+- **发错账号** → webview 顺序不等于账号顺序。发前必须 `listAccounts` 确认。
+- **靠 editor 页 toast 判断成败** → `"反馈已提交""请至少输入10个字"` 都是页面反馈表单的干扰元素, 会误判。存草稿看 `.save-message` 时间戳; 发布看 `/json/list` 的 success URL。
+- **端口写死** → 每次重启变。用 `ensureRunning()` 返回的 port,或 `readPort()`。
+- **软件没开就直连** → `fetch failed`。开头先调 `ensureRunning()`,别让用户手动开。
+- **spawn 主 exe 启动** → stub 立即自杀,不开端口。必须 `explorer.exe <exe路径>`。
+- **喂错封面 input** → 面板有 3 个 file input,只有 `.el-upload__input` 是封面,`.cfw-file-input` 是反馈表单。
+- **⚠️ 平台每日发文配额(CSDN=每账号每天 2 篇)** → 这是**发布平台的规则,不是创作罐头工具的限制**;创作罐头是多平台管理器,接入的其他平台(抖音/B站/百家号/小红书等)各有各的配额,发前按目标平台查清。CSDN 发满 2 篇后:草稿能存、标签能加、发布按钮也点得到,但平台**静默拒绝发布**(publish 返回 false、文章仍在草稿箱、管理后台"已发布"不增加)。**别把它误判成"按钮没点到/webview 冻结/saveDraft 假阴性"反复重试**——发前先数该账号当天已发数,到上限就等次日配额刷新。(2026-08-21 实测踩坑:三个 CSDN 号各发满 2 篇后,新三篇怎么发都失败,折腾多轮才发现是配额。)
+- **checkAudit(HTTP 200)不能证明"已发布/已过审"** → 作者登录态访问自己**草稿**的公开链接也返 200+标题;被判**广告营销**的文章照样返 200。唯一权威判据 = 读管理后台 `mp.csdn.net/mp_blog/manage/article` 的 tab 计数(文章进"已发布"、不在"草稿箱/审核中·未通过")。
+- **⚠️ "新草稿未就绪/webview 冻结"多半是误报,真凶是 `openNewDraft` 卡在 `ce==='true'`** → 血泪教训(2026-08-23):cledit 在 `Page.navigate` 后**长期停在 `contenteditable=false`**,而 `fillArticle()` 内部自己会强制 ce=true 再 paste,填充**根本不依赖 ce**。旧就绪判据死等 ce==='true' 这个永不到来的状态,把每次导航都误报成"冻结",折腾整整一轮。**结论:自己 `Page.navigate` 编辑器 webview 完全可行,不用靠应用打开;openNewDraft 判据只看 `hasEd && hasTitle && len>=1`,绝不看 ce**(已在引擎修好)。多账号串行只需切账号(点主界面 czgts.cn 的手机号 chip)+ 逐个导航,不会真冻结。
+- **⚠️ `saveDraft`(Ctrl+S)靠键盘事件,webview 非 OS 焦点时收不到 → articleId 永不出现、误判失败** → 别卡在存草稿上反复重试。**填充成功后直接 `publish()`**——publish 是 DOM 点击(`element.click()`),不依赖键盘焦点,节流下照常工作(标签也这么加)。"手动点发布能成"正是此理。publish 本身就持久化文章,不需要先存草稿;aid 从新出现的 `creation/success/{aid}` 页提取。
+- **被判广告营销的诱因是"商业意图簇"**,不是品牌次数 → 命中"XX 软件/下载/哪个好"这类找付费软件的搜索意图,文章天然像软件推广被判违规(163953064 实测)。选簇优先"怎么写/怎么做/原理/教程"知识意图;答案块里品牌只作"一个可选方案"一句带过,别连列产品功能;标题别含"软件/下载"。建议本地维护一份 badcase 清单积累被判违规的特征。
+
+## Safety
+
+- **默认只到"存草稿"为止**。存草稿不公开、可逆。
+- **发布是公开且不易撤回的动作** —— 只有在用户**明确说"发布"**后才调 `publish()`。一次授权不覆盖下一篇。
+- 批量发文在每篇之间留随机间隔(建议数分钟), CSDN 对短时间高频发文有风控。
+- 这是用户自己的软件/账号/内容, 授权明确。

@@ -1,0 +1,23 @@
+# 依赖(靠 npm install 还原,不入库)
+node_modules/
+
+# 运行产物 / 日志
+*.log
+*.tmp
+
+# 本地发布流水与产物(含账号/链接,不入库)
+*.csv
+editor-dump.md
+*.png
+*.jpg
+
+# 凭据 / 环境变量
+.env
+.env.*
+*.key
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
