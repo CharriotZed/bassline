@@ -274,11 +274,12 @@ async function setCover(c, coverPath) {
   return { ok, reason: ok ? 'cover-set' : '未检测到封面预览,可能未设上' };
 }
 
-// 发布：开面板→(可选设封面前调用方自理)→确认标签→点红色btn-b-red→查success URL。
-// 返回 {published, successUrl, tag}。发布是公开不可逆动作，调用方须已获用户明确授权。
+// 发布：开面板→确认标签→点红色btn-b-red→查success URL。
+// 返回 {published, successUrl, articleId, tag}。发布是公开不可逆动作，调用方须已获用户明确授权。
 // 若外部已用openPublishPanel开好面板(比如为了先设封面),本函数会复用不重开。
-// articleId: 本文ID。**必须传**——用于精确匹配 creation/success/{articleId},
-// 否则会误抓上一篇残留的成功页(那些webview不会自动关),造成假阳性。
+// articleId 可选:传了就用它精确匹配 creation/success/{articleId}。
+// **不传也安全**——本函数在点击前快照已有的 success 页集合,只认"点击后新出现"的那条,
+// 因此不会误抓上一篇残留的成功页(那些webview不会自动关)。articleId 从成功页URL回读并返回。
 async function publish(c, port, articleId) {
   // 面板没开才开(兼容外部已开好+设过封面的情况)
   const panelOpen = await c.eval(`!!document.querySelector('button.btn-b-red')`);
@@ -290,24 +291,29 @@ async function publish(c, port, articleId) {
     return t?{text:(t.textContent||'').trim(),hasClose:!!t.querySelector('[class*="close"]')}:null;
   })()`);
   if (!tag || !tag.text) return { published: false, reason: 'no-tag', tag };
+  // 点击前快照已有 success 页——无论调用方传不传 articleId 都能只认新增,不误抓残留成功页
+  const before = new Set((await (await fetch(`http://127.0.0.1:${port}/json/list`)).json())
+    .filter(t => /mp_blog\/creation\/success\//.test(t.url)).map(t => t.url));
   // 点红色最终确认
   await c.eval(`(function(){
     const pub=[...document.querySelectorAll('button.btn-b-red')].find(b=>/发布文章/.test(b.textContent||'')&&b.offsetParent!==null);
     if(pub) pub.click();
   })()`);
-  // 结果判据：出现 creation/success/{本文articleId} 的 webview（别看editor页toast，那是反馈表单干扰）。
-  // 必须精确匹配本文 articleId——上一篇的成功页webview不会自动关，只匹配 /success/ 会误抓成假阳性。
-  const successRe = articleId
-    ? new RegExp('mp_blog/creation/success/' + articleId + '\\b')
-    : /mp_blog\/creation\/success\//;   // 未传articleId时退回宽松匹配(有假阳性风险,应尽量传)
+  // 结果判据：出现 creation/success/ 的新 webview（别看editor页toast，那是反馈表单干扰）。
+  // 传了articleId用严格匹配; 没传就认"点击后新出现"的success页(before-diff)。
+  const strictRe = articleId ? new RegExp('mp_blog/creation/success/' + articleId + '\\b') : null;
   let successUrl = null;
   for (let i = 0; i < 15; i++) {
     await sleep(2000);
     const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-    const s = list.find(t => successRe.test(t.url));
+    const s = list.find(t => {
+      if (!/mp_blog\/creation\/success\//.test(t.url)) return false;
+      return strictRe ? strictRe.test(t.url) : !before.has(t.url);
+    });
     if (s) { successUrl = s.url; break; }
   }
-  return { published: !!successUrl, successUrl, tag: tag.text };
+  const aid = articleId || (successUrl && (successUrl.match(/success\/(\d+)/) || [])[1]) || null;
+  return { published: !!successUrl, successUrl, articleId: aid, tag: tag.text };
 }
 
 // 拼公开浏览链接
@@ -357,6 +363,31 @@ async function checkAudit(c, account, articleId, titleSnippet) {
   return { passed: false, status: r.status, reason, url };
 }
 
+// 默认CSV路径(和recordArticle一致)
+function defaultCsvPath() {
+  return process.env.CZGTS_CSV || path.join(os.homedir(), 'czgts-published.csv');
+}
+
+// 统计某账号"今天"已发布篇数——用于发布前配额预检(CSDN每账号每天2篇上限)。
+// 数据源=本地CSV(recordArticle写的发布流水),100%可靠、无需抓管理页DOM。
+// ⚠️盲区:只统计"本流水线发过的",不含你手动在别处发的。若同一天也手动发过,以管理后台"已发布"tab为权威。
+// 返回今天该账号的行数。CSV时间列由 toLocaleString('zh-CN') 写入,今天前缀=toLocaleDateString('zh-CN')(如 2026/8/26)。
+function countPublishedToday(account, csvPath) {
+  csvPath = csvPath || defaultCsvPath();
+  let text = '';
+  try { text = fs.readFileSync(csvPath, 'utf8').replace(/^﻿/, ''); } catch (e) { return 0; }
+  const today = new Date().toLocaleDateString('zh-CN'); // 无补零,与写入格式一致
+  const lines = text.trim().split(/\r?\n/).slice(1); // 跳表头
+  let n = 0;
+  for (const line of lines) {
+    // 字段可能带引号(新行)或不带(旧行);逐字段去引号解析前两列足够
+    const fields = line.split(',').map(f => f.replace(/^"|"$/g, ''));
+    const timeCol = fields[0] || '', acctCol = fields[1] || '';
+    if (acctCol === account && timeCol.startsWith(today)) n++;
+  }
+  return n;
+}
+
 // 记录过审文章到本地CSV(Excel可直接打开)。字段:时间,账号,标题,公开链接,articleId
 // 默认写 用户主目录\czgts-published.csv(可用 CZGTS_CSV 环境变量或第2参数覆盖), 幂等去重(同articleId不重复写)
 function recordArticle({ account, title, articleId, url }, csvPath) {
@@ -381,8 +412,147 @@ function recordArticle({ account, title, articleId, url }, csvPath) {
   return { written: true, csvPath };
 }
 
+// ── 批量编排(以前散在各 publish-*.js 里重写N遍,现收口进引擎) ──
+
+// 点主界面(czgts.cn外壳)的账号标签(手机号chip)切号——客户端一次只有前台一个活跃webview,
+// CDP的activateTarget唤不醒,必须点应用外壳的账号标签。返回 'clicked'/'clicked-el'/'not-found'。
+async function switchAccount(port, phone) {
+  const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+  const main = list.find(t => t.type === 'page' && /czgts\.cn/.test(t.url));
+  if (!main) return 'no-shell';
+  const c = new CDP(main.webSocketDebuggerUrl);
+  try {
+    await c.connect(); await c.send('Runtime.enable');
+    return await c.eval(`(function(){
+      const el=[...document.querySelectorAll('*')].find(e=>{const own=[...e.childNodes].filter(n=>n.nodeType===3).map(n=>n.textContent).join('');return own.includes('${phone}');});
+      if(!el)return 'not-found';
+      let n=el;for(let i=0;i<6;i++){if(/AccountName|account|item|card/i.test((n.className||'').toString())){n.click();return 'clicked';}n=n.parentElement;if(!n)break;}
+      el.click();return 'clicked-el';
+    })()`);
+  } finally { c.close(); }
+}
+
+// 遍历所有CSDN webview,读cookie UserName匹配目标账号,返回该target(未找到返回null)。
+async function findWebviewByAccount(port, account) {
+  const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+  for (const w of list.filter(t => t.type === 'webview')) {
+    const c = new CDP(w.webSocketDebuggerUrl);
+    try {
+      await c.connect(); await c.send('Runtime.enable');
+      const u = await c.eval(`(document.cookie.match(/UserName=([^;]+)/)||[])[1]`).catch(() => '?');
+      if (u === account) { c.close(); return w; }
+    } catch (e) {} finally { c.close(); }
+  }
+  return null;
+}
+
+// 确保发布面板里有已选标签:没有就点"添加文章标签"→找标签input→输入+回车。返回当前标签数组。
+// **前提:发布面板已打开**(先 openPublishPanel)。
+async function ensureTag(c, tag) {
+  let tags = await c.eval(`[...document.querySelectorAll('.el-tag')].filter(x=>x.offsetParent!==null).map(x=>(x.textContent||'').trim())`).catch(() => []);
+  if (tags.length) return tags;
+  await c.eval(`(function(){const b=[...document.querySelectorAll('.tag__btn-tag,button,a,span')].find(e=>/添加文章标签/.test((e.textContent||'').trim())&&e.offsetParent!==null);if(b)b.click();})()`);
+  await sleep(1000);
+  await c.send('DOM.enable');
+  const doc = await c.send('DOM.getDocument', { depth: -1 });
+  const { nodeIds } = await c.send('DOM.querySelectorAll', { nodeId: doc.root.nodeId, selector: 'input' });
+  for (const nid of nodeIds) {
+    const d = await c.send('DOM.describeNode', { nodeId: nid });
+    if (/标签/.test((d.node.attributes || []).join(' '))) {
+      await c.send('DOM.focus', { nodeId: nid });
+      await c.send('Input.insertText', { text: tag });
+      await sleep(500);
+      await c.send('Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter' });
+      await c.send('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter' });
+      break;
+    }
+  }
+  await sleep(1200);
+  return await c.eval(`[...document.querySelectorAll('.el-tag')].filter(x=>x.offsetParent!==null).map(x=>(x.textContent||'').trim())`).catch(() => []);
+}
+
+// 批量串行发布。jobs=[{account, phone, title, body, tag}](body为原始markdown,内部会cleanArticle清洗)。
+// 每篇: 配额预检(<2) → 切号 → 定位webview → 开草稿 → 校验账号防发错 → 清洗+填充 → 开面板+标签 → publish → 记录。
+// 客户端架构决定必须串行(一次只一个活跃webview),无法并发。发布是公开不可逆动作,调用方须已获授权。
+// opts: {gap=[25000,15000] 间隔基数+抖动ms, dailyCap=2 每账号每日上限, logPath}。
+// 返回 [{account, title, status, reason?, url?, aid?, ms}]; 同时把结果+汇总写入 batch-log(JSONL)。
+async function publishBatch(jobs, opts = {}) {
+  const { cleanArticle } = require('./clean-article');
+  const run = await ensureRunning();
+  if (!run.running) throw new Error('创作罐头未就绪: ' + JSON.stringify(run));
+  const port = run.port;
+  const gapBase = (opts.gap && opts.gap[0]) ?? 25000;
+  const gapJit = (opts.gap && opts.gap[1]) ?? 15000;
+  const cap = opts.dailyCap ?? 2;
+  const logPath = opts.logPath || process.env.CZGTS_BATCH_LOG || path.join(os.homedir(), 'czgts-batch-log.jsonl');
+  const results = [];
+
+  for (let i = 0; i < jobs.length; i++) {
+    const job = jobs[i];
+    const t0 = Date.now();
+    const rec = (status, extra = {}) => {
+      const r = { ts: new Date().toISOString(), account: job.account, title: job.title, status, ms: Date.now() - t0, ...extra };
+      results.push(r);
+      try { fs.appendFileSync(logPath, JSON.stringify(r) + '\n', 'utf8'); } catch (e) {}
+      return r;
+    };
+    let c = null;
+    try {
+      // #1 配额预检——不白跑生成/填充(数本地CSV今天该号已发数)
+      const already = countPublishedToday(job.account);
+      if (already >= cap) { rec('quota', { reason: `今日已发${already}/${cap}篇` }); continue; }
+
+      const body = cleanArticle(job.body, job.title);
+      if (!require('./clean-article').assertClean(body).clean) { rec('dirty', { reason: '脚手架残留' }); continue; }
+
+      await switchAccount(port, job.phone);
+      await sleep(3000);
+      const wv = await findWebviewByAccount(port, job.account);
+      if (!wv) { rec('no-webview'); continue; }
+      c = new CDP(wv.webSocketDebuggerUrl);
+      await c.connect(); await c.send('Runtime.enable'); await c.send('Page.enable'); await c.send('DOM.enable');
+      c._targetId = wv.id;
+
+      const nd = await openNewDraft(c);
+      if (!nd.ok) { rec('draft', { reason: nd.reason || 'editor-not-ready' }); c.close(); c = null; continue; }
+      // 校验账号防发错号
+      const chk = await c.eval(`(document.cookie.match(/UserName=([^;]+)/)||[])[1]`);
+      if (chk !== job.account) { rec('acct-mismatch', { reason: `${chk}≠${job.account}` }); c.close(); c = null; continue; }
+
+      const fill = await fillArticle(c, job.title, body);
+      if (!fill.ok) { rec('fill', { reason: JSON.stringify({ len: fill.len, nn: fill.nn }) }); c.close(); c = null; continue; }
+
+      await openPublishPanel(c); await sleep(1000);
+      const tags = await ensureTag(c, job.tag);
+      if (!tags.length) { rec('no-tag'); c.close(); c = null; continue; }
+
+      const p = await publish(c, port);  // 自包含before-diff,无需传articleId
+      if (p.published) {
+        const url = publicUrl(job.account, p.articleId);
+        recordArticle({ account: job.account, title: job.title, articleId: p.articleId, url });
+        rec('PUBLISHED', { url, aid: p.articleId, tag: p.tag });
+      } else {
+        // publish失败:再查配额区分"配额耗尽" vs "真技术故障"(消歧,别再误判成按钮没点到)
+        const nowCount = countPublishedToday(job.account);
+        rec(nowCount >= cap ? 'quota-hit' : 'no-success', { reason: p.reason || '无新success页' });
+      }
+      c.close(); c = null;
+    } catch (e) {
+      rec('error', { reason: e.message });
+      try { c && c.close(); } catch (_) {}
+      c = null;
+    }
+    if (i < jobs.length - 1) await sleep(gapBase + Math.random() * gapJit);
+  }
+
+  const summary = results.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
+  try { fs.appendFileSync(logPath, JSON.stringify({ ts: new Date().toISOString(), summary }) + '\n', 'utf8'); } catch (e) {}
+  return results;
+}
+
 module.exports = {
   readPort, portReachable, ensureRunning, listAccounts, connectPage, closePage,
   openNewDraft, fillArticle, saveDraft, verifyDraft, openPublishPanel, setCover, publish, sleep,
-  publicUrl, checkAudit, recordArticle, notify
+  publicUrl, checkAudit, recordArticle, notify,
+  countPublishedToday, switchAccount, findWebviewByAccount, ensureTag, publishBatch
 };

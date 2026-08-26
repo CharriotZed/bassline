@@ -67,22 +67,34 @@ const r = await z.fillArticle(c, title, body);   // fillArticle 内置 assertCle
 if (!r.ok) throw new Error('排版校验未过: ' + JSON.stringify(r));
 
 // 4. 发布(仅在用户明确授权后!)。**跳过 saveDraft,直接 publish**——见下方"存草稿键盘失效"。
-//    发布前先记录已有 success URL 集合,publish 只认"新出现"的 creation/success/{aid} 页。
 //    带封面时:openPublishPanel → setCover → publish(复用已开面板)
-const before = new Set((await (await fetch(`http://127.0.0.1:${port}/json/list`)).json())
-  .filter(t => /creation\/success\//.test(t.url)).map(t => t.url));
 await z.openPublishPanel(c);
 // await z.setCover(c, coverAbsPath);            // 可选封面
-const p = await z.publish(c, port);              // publish 内部点红色按钮; 也可自己抓 before 外的新 success URL 提 aid
-// aid 从新 success URL 提取: /creation\/success\/(\d+)/
+const p = await z.publish(c, port);              // 自包含:点击前快照success页,只认新增,不传articleId也安全
+// p = {published, successUrl, articleId, tag}   // articleId 已从新success页回读
 
 // 5. 记录到本地CSV(用管理后台"已发布"tab 核实, 别只信 success URL/HTTP200)
-// z.recordArticle({ account, title, articleId: aid, url: z.publicUrl(account, aid) });
+if (p.published) z.recordArticle({ account, title, articleId: p.articleId, url: z.publicUrl(account, p.articleId) });
 
 z.closePage(c);
 ```
 
 **发布前务必校验当前 webview 账号**(`cookie UserName === 目标账号`),webview 顺序会变,不校验会发错号。
+
+### 批量发布首选 `publishBatch()`(别再手写 publish-*.js)
+以前每个批量脚本都把「切号→定位webview→开草稿→校验账号→清洗→填充→标签→发布→记录」重写一遍,易漂移出 bug。现已收口进引擎:
+```js
+const results = await z.publishBatch([
+  { account: '2601_xxx', phone: '188xxxx', title, body: rawMarkdown, tag: '游戏' },
+  // ...每个号一篇
+]);
+// 内部逐篇: 配额预检(今日<2跳过) → 切号 → 开草稿 → 校验账号防发错 → cleanArticle+填充
+//          → 标签 → publish(自包含) → recordArticle。串行(客户端一次只一个活跃webview,无法并发)。
+// results: [{account,title,status,reason?,url?,aid?,ms}]; 同时写 ~/czgts-batch-log.jsonl(含失败原因,可复盘)
+// status: PUBLISHED / quota(预检超限) / quota-hit(发布失败且已达上限) / dirty / no-webview
+//         / draft / acct-mismatch / fill / no-tag / no-success / error
+```
+配套函数:`countPublishedToday(account)`(数本地CSV今日该号已发数)、`switchAccount(port,phone)`、`findWebviewByAccount(port,account)`、`ensureTag(c,tag)`。
 
 ### 自动启动 (#1)
 `ensureRunning()` 已封装,端口不可达时自动拉起软件。**正确启动方式 = `explorer.exe <主exe绝对路径>`**(走 shell 语义 = 等同双击),实测端口约 2 秒就绪。两个踩过的坑:
