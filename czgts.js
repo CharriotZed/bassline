@@ -159,15 +159,26 @@ async function fillArticle(c, title, body) {
     el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true}));
   })()`);
 
-  // 先清空默认模板：托管态(ce=true)下 execCommand('delete') 全选删除有效。
-  // 注意仅在托管态生效——若页面被reload搞成非托管态则清不掉，openNewDraft保证了托管态。
-  await c.eval(`(function(){
-    const ed=document.querySelector('.editor__inner'); ed.focus();
-    const sel=window.getSelection(); const r=document.createRange(); r.selectNodeContents(ed);
-    sel.removeAllRanges(); sel.addRange(r);
-    document.execCommand('delete',false,null);
-  })()`);
-  await sleep(400);
+  // 先清空已有内容(默认模板 或 webview残留的上一篇)。
+  // ⚠️血泪(2026-08-26): 必须先强制 ce=true 再 delete——cledit 在 navigate 后停在 ce=false,
+  // 非托管态下 execCommand('delete') 静默无效,啥也没删,紧接着 paste 就把新正文追加在残留内容后面,
+  // 叠成"两篇合一"(实测 076 残留上一篇→7997字, 幸被 fillArticle 长度校验拦下未发)。
+  // 所以: 每轮先 ce=true 再全选删除, 删完验证是否清空, 没清干净就重试(最多3轮)。
+  let cleared = false;
+  for (let k = 0; k < 3; k++) {
+    const remain = await c.eval(`(function(){
+      const ed=document.querySelector('.editor__inner');
+      ed.setAttribute('contenteditable','true'); ed.focus();
+      const sel=window.getSelection(); const r=document.createRange(); r.selectNodeContents(ed);
+      sel.removeAllRanges(); sel.addRange(r);
+      document.execCommand('delete',false,null);
+      return (ed.innerText||'').trim().length;
+    })()`);
+    if (remain <= 2) { cleared = true; break; }
+    await sleep(400);
+  }
+  if (!cleared) return { ok: false, reason: 'clear-failed', ...(await c.eval(`(function(){const e=document.querySelector('.editor__inner');return {len:(e.innerText||'').length};})()`)) };
+  await sleep(300);
 
   // paste整篇：cledit的粘贴处理会原样保留空行。绝不用execCommand insertText(会折叠空行毁排版)
   await c.eval(`(function(){
