@@ -16,6 +16,9 @@ editor-dump.md
 .env.*
 *.key
 
+# 账号映射(含真实手机号+CSDN账号, 绝不入库)
+accounts.json
+
 # 编辑器 / 系统
 .vscode/
 .idea/

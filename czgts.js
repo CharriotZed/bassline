@@ -457,6 +457,55 @@ async function findWebviewByAccount(port, account) {
   return null;
 }
 
+// 读主界面所有账号标签上的手机号(chip 文本里的 11 位手机号)。返回 ['188...','153...',...]。
+// ⚠️必须把 innerText 拉回 Node 侧再匹配——页面 eval 内跑同一正则会因模板转义 subtlety 返回空
+// (实测: 页面侧 /1[3-9]\d{9}/g 命中 0, Node 侧同正则同文本命中全部)。
+async function listPhones(port) {
+  const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+  const main = list.find(t => t.type === 'page' && /czgts\.cn/.test(t.url));
+  if (!main) return [];
+  const c = new CDP(main.webSocketDebuggerUrl);
+  try {
+    await c.connect(); await c.send('Runtime.enable');
+    const txt = await c.eval('document.body ? document.body.innerText : ""');
+    return [...new Set((txt.match(/1[3-9]\d{9}/g) || []))];
+  } finally { c.close(); }
+}
+
+// 自动建立 {phone → account} 映射:枚举手机号→逐个点chip切前台→读"刚激活"webview的cookie账号名。
+// 换新号后无需手填映射,跑一次即可。返回 {map:[{phone,account,nick}], diag:[...每步全量诊断]}。
+// ⚠️配对信号不是 visibilityState——实测创作罐头所有webview恒报 visible,该判据无效。
+// 真实信号: 被激活的 webview 会跳到 /json/list 的最前面(Chrome DevTools 按激活时间排序)。
+// 所以取"切换后列表里第一个CSDN webview"= 刚激活的账号。diag 里带上列表顺序供核验。
+async function discoverAccounts(port, { settle = 3000 } = {}) {
+  port = port || readPort();
+  const phones = await listPhones(port);
+  const map = [], diag = [];
+  for (const phone of phones) {
+    const sw = await switchAccount(port, phone);
+    await sleep(settle);
+    // 切换后按列表顺序读CSDN webview的账号(首位=刚激活)
+    const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+    const csdn = list.filter(t => t.type === 'webview' && /csdn/.test(t.url));
+    const rows = [];
+    for (const w of csdn) {
+      const c = new CDP(w.webSocketDebuggerUrl);
+      try {
+        await c.connect(); await c.send('Runtime.enable');
+        const r = await c.eval(`({
+          account: (document.cookie.match(/UserName=([^;]+)/)||[])[1]||null,
+          nick: decodeURIComponent((document.cookie.match(/UserNick=([^;]+)/)||[])[1]||'')
+        })`).catch(() => ({ account: null }));
+        rows.push({ id: w.id, ...r });
+      } catch (e) {} finally { c.close(); }
+    }
+    diag.push({ phone, switchResult: sw, order: rows.map(r => r.account) });
+    const first = rows.find(r => r.account); // 列表首位=刚激活
+    if (first) map.push({ phone, account: first.account, nick: first.nick });
+  }
+  return { map, diag };
+}
+
 // 确保发布面板里有已选标签:没有就点"添加文章标签"→找标签input→输入+回车。返回当前标签数组。
 // **前提:发布面板已打开**(先 openPublishPanel)。
 async function ensureTag(c, tag) {
@@ -565,5 +614,6 @@ module.exports = {
   readPort, portReachable, ensureRunning, listAccounts, connectPage, closePage,
   openNewDraft, fillArticle, saveDraft, verifyDraft, openPublishPanel, setCover, publish, sleep,
   publicUrl, checkAudit, recordArticle, notify,
-  countPublishedToday, switchAccount, findWebviewByAccount, ensureTag, publishBatch
+  countPublishedToday, switchAccount, findWebviewByAccount, ensureTag, publishBatch,
+  listPhones, discoverAccounts
 };
