@@ -94,7 +94,7 @@ const results = await z.publishBatch([
 // status: PUBLISHED / quota(预检超限) / quota-hit(发布失败且已达上限) / dirty / no-webview
 //         / draft / acct-mismatch / fill / no-tag / no-success / error
 ```
-配套函数:`countPublishedToday(account)`(数本地CSV今日该号已发数)、`switchAccount(port,phone)`、`findWebviewByAccount(port,account)`、`ensureTag(c,tag)`。
+配套函数:`countPublishedToday(account)`(数本地CSV今日该号已发数)、`switchAccount(port,chipLabel)`(第2参数是**主界面 chip 上实际显示的文本**——老号是手机号、新号是账号名,按文本匹配;`jobs[].phone` 字段同理,填 chip 文本即可)、`findWebviewByAccount(port,account)`、`ensureTag(c,tag)`。
 
 ### 自动启动 (#1)
 `ensureRunning()` 已封装,端口不可达时自动拉起软件。**正确启动方式 = `explorer.exe <主exe绝对路径>`**(走 shell 语义 = 等同双击),实测端口约 2 秒就绪。两个踩过的坑:
@@ -145,9 +145,12 @@ python scripts/generate_cover.py --platform baijiahao --prompt "文章主题的�
 | 发布面板 | 点 `button.btn-publish` |
 | 发布确认 | 面板内红色 `button.btn-b-red` (文字"发布文章") |
 | **发布成功判据(权威)** | 读管理后台 `mp_blog/manage/article`, 文章进"已发布"tab。**别只信 success URL/HTTP 200** |
-| 文章标签 | 必填; chip 带删除叉=已选中(非推荐待选); 没自动带就点"添加文章标签"手输+回车 |
+| 文章标签 | 必填; **只有带删除叉的 chip 才是已选中**——面板里那排无叉的 `.el-tag`(kubernetes/容器/云原生/mysql/android)是**待点击候选**,点了才算选上 |
+| 加标签三条路径 | ①候选里有目标标签→直接 `click()` ②输入框手输+回车(placeholder=`请输入文字搜索，Enter键入可添加自定义标签`) ③兜底点第一个候选 |
 | **每日发文上限(平台配额)** | CSDN=每账号每天 2 篇, 发满后发布被静默拒绝。这是**平台规则非工具限制**——其他平台(抖音/B站/百家号等)各有配额, 发前按平台查 |
-| 账号切前台 | 点主界面(czgts.cn)账号标签(手机号 chip), 非 CDP activateTarget |
+| 账号切前台 | 点主界面(czgts.cn)账号 chip, 非 CDP activateTarget |
+| chip 显示什么 | **不统一**:老号显示手机号(<手机号>),新号显示账号名(<账号名>)。`switchAccount` 按文本节点 includes 匹配,所以传谁取决于 chip 实际文本,两者都能点中 |
+| 可用账号数 | **别按 accounts.json 推断**(它只维护了部分 phone→account 映射,照它算会漏掉只显示账号名的号)。发前 dump 一次 chip 实际文本:遍历 DOM 找自有文本匹配 `^1\d{10}$` 或 `^2601_\d+$` |
 
 ## Common Mistakes
 
@@ -163,6 +166,8 @@ python scripts/generate_cover.py --platform baijiahao --prompt "文章主题的�
 - **checkAudit(HTTP 200)不能证明"已发布/已过审"** → 作者登录态访问自己**草稿**的公开链接也返 200+标题;被判**广告营销**的文章照样返 200。唯一权威判据 = 读管理后台 `mp.csdn.net/mp_blog/manage/article` 的 tab 计数(文章进"已发布"、不在"草稿箱/审核中·未通过")。
 - **⚠️ "新草稿未就绪/webview 冻结"多半是误报,真凶是 `openNewDraft` 卡在 `ce==='true'`** → 血泪教训(2026-08-23):cledit 在 `Page.navigate` 后**长期停在 `contenteditable=false`**,而 `fillArticle()` 内部自己会强制 ce=true 再 paste,填充**根本不依赖 ce**。旧就绪判据死等 ce==='true' 这个永不到来的状态,把每次导航都误报成"冻结",折腾整整一轮。**结论:自己 `Page.navigate` 编辑器 webview 完全可行,不用靠应用打开;openNewDraft 判据只看 `hasEd && hasTitle && len>=1`,绝不看 ce**(已在引擎修好)。多账号串行只需切账号(点主界面 czgts.cn 的手机号 chip)+ 逐个导航,不会真冻结。
 - **⚠️ `saveDraft`(Ctrl+S)靠键盘事件,webview 非 OS 焦点时收不到 → articleId 永不出现、误判失败** → 别卡在存草稿上反复重试。**填充成功后直接 `publish()`**——publish 是 DOM 点击(`element.click()`),不依赖键盘焦点,节流下照常工作(标签也这么加)。"手动点发布能成"正是此理。publish 本身就持久化文章,不需要先存草稿;aid 从新出现的 `creation/success/{aid}` 页提取。
+- **⚠️ `publish` 返 `no-success` 而配额没满 → 先查标签是不是"从来没真加上"** → 血泪教训(2026-08-27,20篇批量里1篇卡死,查了三轮):CSDN 发布面板会渲染一排**待点击候选标签**(kubernetes/容器/云原生/mysql/android),它们同样是可见 `.el-tag`,**但没有删除叉**——点了才算选上。引擎当时有三处把候选误当已选中: ①`ensureTag` 开头只看 `.el-tag` 数量非空就 return,直接跳过加标签 ②它的 return 同样不过滤,加标签失败时仍报告"有5个标签",把失败一路掩盖到 publish 才暴露 ③`publish` 前置检查读了 `hasClose` 却没让它参与判断,拿到 `kubernetes` 文本非空就放行。结果:标签必填未满足→平台**静默拒绝发布**,表现和"配额耗尽/按钮没点到"一模一样。**判据:只认带删除叉的 chip**(引擎已加 `SELECTED_TAGS_JS` 统一此判据,三处共用)。这 bug 平时被 CSDN 自动带标签掩盖,只在候选没命中目标标签时才暴露。
+- **⚠️ `ensureTag` 无条件点"添加文章标签"会把已开的面板 toggle 关掉** → 关掉后 `DOM.focus`+`insertText` 打在**不可见**输入框上静默落空,标签永远加不上。必须先判 `.mark_add_tag` 是否可见,没开才点。手输路径也要确认输入框可见(`DOM.getBoxModel` 拿不到就跳过)。
 - **被判广告营销的诱因是"商业意图簇"**,不是品牌次数 → 命中"XX 软件/下载/哪个好"这类找付费软件的搜索意图,文章天然像软件推广被判违规(163953064 实测)。选簇优先"怎么写/怎么做/原理/教程"知识意图;答案块里品牌只作"一个可选方案"一句带过,别连列产品功能;标题别含"软件/下载"。建议本地维护一份 badcase 清单积累被判违规的特征。
 
 ## Safety

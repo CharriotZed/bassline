@@ -296,12 +296,15 @@ async function publish(c, port, articleId) {
   const panelOpen = await c.eval(`!!document.querySelector('button.btn-b-red')`);
   if (!panelOpen) await openPublishPanel(c);
   await sleep(500);
-  // 确认标签已选中(chip带删除叉)
-  const tag = await c.eval(`(function(){
-    const t=[...document.querySelectorAll('.el-tag')].find(x=>x.offsetParent!==null&&(x.textContent||'').trim());
-    return t?{text:(t.textContent||'').trim(),hasClose:!!t.querySelector('[class*="close"]')}:null;
-  })()`);
-  if (!tag || !tag.text) return { published: false, reason: 'no-tag', tag };
+  // 确认标签已**真选中**(chip带删除叉)。旧代码取第一个可见.el-tag、只判文本非空,
+  // 会把 CSDN 的推荐待选标签(无删除叉)当成已选中而放行→平台因标签必填静默拒发。
+  const selected = await c.eval(SELECTED_TAGS_JS).catch(() => []);
+  if (!selected.length) {
+    const suggested = await c.eval(`[...document.querySelectorAll('.el-tag')]
+      .filter(x=>x.offsetParent!==null).map(x=>(x.textContent||'').trim()).filter(Boolean)`).catch(() => []);
+    return { published: false, reason: 'no-tag', tag: null, suggestedOnly: suggested };
+  }
+  const tag = { text: selected[0], all: selected };
   // 点击前快照已有 success 页——无论调用方传不传 articleId 都能只认新增,不误抓残留成功页
   const before = new Set((await (await fetch(`http://127.0.0.1:${port}/json/list`)).json())
     .filter(t => /mp_blog\/creation\/success\//.test(t.url)).map(t => t.url));
@@ -508,27 +511,70 @@ async function discoverAccounts(port, { settle = 3000 } = {}) {
 
 // 确保发布面板里有已选标签:没有就点"添加文章标签"→找标签input→输入+回车。返回当前标签数组。
 // **前提:发布面板已打开**(先 openPublishPanel)。
+// ⚠️只认"带删除叉"的chip=真已选中。CSDN 会在面板里渲染一排**推荐待选**标签
+// (如 kubernetes/容器/云原生/mysql/android),它们同样是 .el-tag 且可见,但没有删除叉。
+// 旧代码只看 .el-tag 数量非空就 return,把推荐待选误当已选中→从不真正加标签→
+// 标签必填未满足→平台静默拒绝发布→publish 返 no-success(2026-08-27 实测踩坑)。
+const SELECTED_TAGS_JS = `[...document.querySelectorAll('.el-tag')]
+  .filter(x=>x.offsetParent!==null && x.querySelector('[class*="close"]'))
+  .map(x=>(x.textContent||'').trim()).filter(Boolean)`;
+
 async function ensureTag(c, tag) {
-  let tags = await c.eval(`[...document.querySelectorAll('.el-tag')].filter(x=>x.offsetParent!==null).map(x=>(x.textContent||'').trim())`).catch(() => []);
+  let tags = await c.eval(SELECTED_TAGS_JS).catch(() => []);
   if (tags.length) return tags;
-  await c.eval(`(function(){const b=[...document.querySelectorAll('.tag__btn-tag,button,a,span')].find(e=>/添加文章标签/.test((e.textContent||'').trim())&&e.offsetParent!==null);if(b)b.click();})()`);
-  await sleep(1000);
+
+  // ⚠️面板没开才点"添加文章标签"。旧代码无条件点 → 面板已开时这一点把它 toggle **关掉**,
+  // 后续 DOM.focus+insertText 打到不可见输入框上静默落空,标签始终加不上(2026-08-27实测)。
+  const panelOpen = await c.eval(`(function(){const p=document.querySelector('.mark_add_tag');return !!(p&&p.offsetParent!==null);})()`);
+  if (!panelOpen) {
+    await c.eval(`(function(){const b=[...document.querySelectorAll('.tag__btn-tag,button,a,span')].find(e=>/添加文章标签/.test((e.textContent||'').trim())&&e.offsetParent!==null);if(b)b.click();})()`);
+    await sleep(1200);
+  }
+
+  // 路径A:目标标签正好在候选里 → 直接点它(候选chip必须点击才变成已选中)
+  const clickedExact = await c.eval(`(function(){
+    const t=[...document.querySelectorAll('.el-tag')].find(x=>x.offsetParent!==null
+      && !x.querySelector('[class*="close"]') && (x.textContent||'').trim()===${JSON.stringify(tag)});
+    if(t){t.click();return true;} return false;
+  })()`).catch(() => false);
+  if (clickedExact) {
+    await sleep(1200);
+    tags = await c.eval(SELECTED_TAGS_JS).catch(() => []);
+    if (tags.length) return tags;
+  }
+
+  // 路径B:输入框手输 + 回车(输入框 placeholder="请输入文字搜索，Enter键入可添加自定义标签")
   await c.send('DOM.enable');
   const doc = await c.send('DOM.getDocument', { depth: -1 });
   const { nodeIds } = await c.send('DOM.querySelectorAll', { nodeId: doc.root.nodeId, selector: 'input' });
   for (const nid of nodeIds) {
     const d = await c.send('DOM.describeNode', { nodeId: nid });
-    if (/标签/.test((d.node.attributes || []).join(' '))) {
-      await c.send('DOM.focus', { nodeId: nid });
-      await c.send('Input.insertText', { text: tag });
-      await sleep(500);
-      await c.send('Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter' });
-      await c.send('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter' });
-      break;
-    }
+    const attrs = (d.node.attributes || []).join(' ');
+    if (!/标签/.test(attrs)) continue;
+    // 只对可见输入框操作,否则又是静默落空
+    const box = await c.send('DOM.getBoxModel', { nodeId: nid }).catch(() => null);
+    if (!box) continue;
+    await c.send('DOM.focus', { nodeId: nid });
+    await c.send('Input.insertText', { text: tag });
+    await sleep(800);
+    await c.send('Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter' });
+    await c.send('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter' });
+    break;
   }
   await sleep(1200);
-  return await c.eval(`[...document.querySelectorAll('.el-tag')].filter(x=>x.offsetParent!==null).map(x=>(x.textContent||'').trim())`).catch(() => []);
+  tags = await c.eval(SELECTED_TAGS_JS).catch(() => []);
+  if (tags.length) return tags;
+
+  // 路径C:兜底——标签必填,手输失败就点第一个候选(内容相关性让位于"能发出去")
+  await c.eval(`(function(){
+    const t=[...document.querySelectorAll('.el-tag')].find(x=>x.offsetParent!==null
+      && !x.querySelector('[class*="close"]') && (x.textContent||'').trim());
+    if(t)t.click();
+  })()`).catch(() => {});
+  await sleep(1200);
+  // ⚠️必须同样只认已选中的chip。旧代码这里用不过滤的表达式,导致"加标签失败"时
+  // 仍把5个推荐待选标签当成结果返回→调用方误判成功→到 publish 才暴露(no-tag)。
+  return await c.eval(SELECTED_TAGS_JS).catch(() => []);
 }
 
 // 批量串行发布。jobs=[{account, phone, title, body, tag}](body为原始markdown,内部会cleanArticle清洗)。
