@@ -127,6 +127,28 @@ python scripts/generate_cover.py --platform baijiahao --prompt "文章主题的�
 - `recordArticle()` 默认写 `%USERPROFILE%\czgts-published.csv`(可用 `CZGTS_CSV` 环境变量覆盖;字段=时间/账号/标题/公开链接/文章ID,按 articleId 幂等去重)。CSV 是"发布流水"≠"存活清单",核实后应补一列真实状态(正常公开/已下架)。
 - 定期核实: 用 `CronCreate` 跑 `verify-anon2.js` 全量匿名核对。
 
+### 流量券推广 (`promote.js`)
+文章发布后 CSDN 会发**流量券**(每日任务券, 如 +1500 曝光), 用在文章上可加曝光。手动路径: 创作中心-内容管理-用券推广 → 券卡片"去使用" → 弹出可选文章列表 → 选文章 → 确定。
+
+```js
+const P = require('./promote');
+const results = await P.promoteBatch([
+  { account: '2601_xxx', chipLabel: '2601_xxx', articles: [{ aid: '164117343', title: '完整标题' }] },
+], { live: true });     // 默认 dry-run(只开弹窗+取消); live:true 才真点确定
+// status: PROMOTED / dry-run / not-in-list / no-coupon / no-dialog / select-fail / confirm-fail
+// 成功写 ~/czgts-promoted.csv(时间/账号/标题/文章ID/券信息, 按articleId幂等), 全过程写 ~/czgts-promote-log.jsonl
+```
+
+**⚠️ 弹窗列表项里没有 articleId**(无 data 属性、无链接, 只有标题文本), 所以只能**按标题匹配**。而账号里往往混着大量历史文章, 因此 `promoteBatch` 的安全设计必须保留:
+- 只认调用方传入的标题白名单, **完全相等**匹配(绝不模糊/包含/按位置选)
+- 每张券投出前打印列表里**不在白名单**的项, 便于事后核对没误选
+- 白名单一篇都没命中 → 点取消退出, 不将就选别的
+- 选中后校验"有且仅有目标项 class 含 active", 不符就取消
+- 一张券只投一篇, 目标投完即停(**剩余券留着**, 不拿已投文章重复投、不投历史文)
+- 用券**不可逆** → 默认 dry-run, 真投前先扫一遍看清各账号列表
+
+**先 dry-run 扫描再真投**。2026-08-27 实测 10 个账号: 券共 54 张、今日 20 篇标题 20/20 命中, 但可选列表里合计 **61 篇历史技术文**(Tomcat/MySQL/SpringBoot 等), 其中一个号占 19 篇 —— 按位置或模糊匹配必然误选。
+
 ## Quick Reference
 
 | 元素 | 选择器 / 判据 |
@@ -151,6 +173,12 @@ python scripts/generate_cover.py --platform baijiahao --prompt "文章主题的�
 | 账号切前台 | 点主界面(czgts.cn)账号 chip, 非 CDP activateTarget |
 | chip 显示什么 | **不统一**:老号显示手机号(<手机号>),新号显示账号名(<账号名>)。`switchAccount` 按文本节点 includes 匹配,所以传谁取决于 chip 实际文本,两者都能点中 |
 | 可用账号数 | **别按 accounts.json 推断**(它只维护了部分 phone→account 映射,照它算会漏掉只显示账号名的号)。发前 dump 一次 chip 实际文本:遍历 DOM 找自有文本匹配 `^1\d{10}$` 或 `^2601_\d+$` |
+| 流量券页 | `mp.csdn.net/mp_blog/manage/traffic`(标题"流量券列表")。**别猜 `/manage/coupon` 或 `/manage/promotion`**——都 404 |
+| "去使用"按钮 | `P.btn`(每张可用券一个; **是 `<p>` 不是 `<button>`**) |
+| 用券弹窗 | `.traffic-dialog-blog` |
+| 可推广文章项 | `.traffic-dialog-item`, 标题在 `p.title span.text`。**项里没有 articleId**(无 data 属性/无链接)→ 只能按标题匹配 |
+| 文章选中态 | 点列表项后 class 追加 `active`(**无 radio/checkbox**) |
+| 用券确定/取消 | `P.success` / `P.fail`(同样是 `<p>` 不是 `<button>`) |
 
 ## Common Mistakes
 
@@ -168,6 +196,9 @@ python scripts/generate_cover.py --platform baijiahao --prompt "文章主题的�
 - **⚠️ `saveDraft`(Ctrl+S)靠键盘事件,webview 非 OS 焦点时收不到 → articleId 永不出现、误判失败** → 别卡在存草稿上反复重试。**填充成功后直接 `publish()`**——publish 是 DOM 点击(`element.click()`),不依赖键盘焦点,节流下照常工作(标签也这么加)。"手动点发布能成"正是此理。publish 本身就持久化文章,不需要先存草稿;aid 从新出现的 `creation/success/{aid}` 页提取。
 - **⚠️ `publish` 返 `no-success` 而配额没满 → 先查标签是不是"从来没真加上"** → 血泪教训(2026-08-27,20篇批量里1篇卡死,查了三轮):CSDN 发布面板会渲染一排**待点击候选标签**(kubernetes/容器/云原生/mysql/android),它们同样是可见 `.el-tag`,**但没有删除叉**——点了才算选上。引擎当时有三处把候选误当已选中: ①`ensureTag` 开头只看 `.el-tag` 数量非空就 return,直接跳过加标签 ②它的 return 同样不过滤,加标签失败时仍报告"有5个标签",把失败一路掩盖到 publish 才暴露 ③`publish` 前置检查读了 `hasClose` 却没让它参与判断,拿到 `kubernetes` 文本非空就放行。结果:标签必填未满足→平台**静默拒绝发布**,表现和"配额耗尽/按钮没点到"一模一样。**判据:只认带删除叉的 chip**(引擎已加 `SELECTED_TAGS_JS` 统一此判据,三处共用)。这 bug 平时被 CSDN 自动带标签掩盖,只在候选没命中目标标签时才暴露。
 - **⚠️ `ensureTag` 无条件点"添加文章标签"会把已开的面板 toggle 关掉** → 关掉后 `DOM.focus`+`insertText` 打在**不可见**输入框上静默落空,标签永远加不上。必须先判 `.mark_add_tag` 是否可见,没开才点。手输路径也要确认输入框可见(`DOM.getBoxModel` 拿不到就跳过)。
+- **⚠️ 流量券推广:按位置/模糊匹配选文章 = 必然误选到历史文章** → 弹窗列表项**没有 articleId**(无 data 属性、无链接,只有标题文本),所以只能按标题匹配,而列表里混着账号本周期内的所有文章。2026-08-27 实测 10 个账号:今日 20 篇全部命中,但可选列表里合计 **61 篇历史技术文**(Tomcat/MySQL/SpringBoot 等),其中一个号占 19 篇。**必须传标题白名单 + 完全相等匹配 + 没命中就取消退出**;选中后再校验"有且仅有目标项 class 含 active"。用券不可逆,真投前先 dry-run 扫一遍各账号列表。
+- **⚠️ 流量券页面路径别猜,去导航菜单里读** → 猜的 `/mp_blog/manage/coupon`、`/mp_blog/manage/promotion` 都 404。真实路径 `/mp_blog/manage/traffic`,而且它在侧边菜单里是**折叠隐藏**的(`a[href]` 存在但 `offsetParent===null`),扫"可见链接"扫不到 —— 要扫全部 `a[href]` 并按 `/推广|券/` 文本或 `promot|coupon|traffic` href 过滤。
+- **⚠️ 用券弹窗的按钮都是 `<p>` 不是 `<button>`** → "去使用"=`P.btn`、确定=`P.success`、取消=`P.fail`。用 `querySelectorAll('button')` 找一个都找不到(实测第一轮探查就因此判定"未找到去使用按钮",而页面文本里明明有)。选中机制也没有 radio/checkbox,靠点列表项后 class 追加 `active`。**这个站点多处如此(标签 chip 同理),扫按钮时别按标签名过滤,按自有文本扫全部元素。**
 - **被判广告营销的诱因是"商业意图簇"**,不是品牌次数 → 命中"XX 软件/下载/哪个好"这类找付费软件的搜索意图,文章天然像软件推广被判违规(163953064 实测)。选簇优先"怎么写/怎么做/原理/教程"知识意图;答案块里品牌只作"一个可选方案"一句带过,别连列产品功能;标题别含"软件/下载"。建议本地维护一份 badcase 清单积累被判违规的特征。
 
 ## Safety
