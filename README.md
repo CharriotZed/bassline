@@ -1,5 +1,12 @@
 # czgts-publish
 
+> ⚠️ 本仓库名为 `bassline`，但 skill 名是 `czgts-publish`（[SKILL.md](SKILL.md) 的 frontmatter `name` 字段）。
+> 作为 Claude Code skill 安装时，**目录名必须与 skill 名一致**，所以 clone 时要显式指定目录：
+> ```bash
+> git clone https://github.com/CharriotZed/bassline.git czgts-publish
+> ```
+> 直接 `git clone` 会落地成 `bassline/`，目录名与 frontmatter 不匹配。
+
 通过 CDP（Chrome DevTools Protocol）驱动「创作罐头」(Muse) 桌面客户端，复用其中已登录的账号会话，自动化地向 CSDN 等自媒体平台发文——不碰登录、不模拟鼠标点像素。
 
 创作罐头是 Electron 套壳应用，运行时开着 Chrome DevTools 调试端口。每个登录的平台账号是一个 `type=webview` target，用原始 WebSocket 直连其 `webSocketDebuggerUrl` 即可驱动（Playwright 的 `connectOverCDP` 看不到 webview）。
