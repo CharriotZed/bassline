@@ -117,15 +117,33 @@ python scripts/generate_cover.py --platform baijiahao --prompt "文章主题的�
 2. **只看 HTTP 状态不够** —— 要看渲染后的正文,不是状态码。
 3. **裸 fetch 高频 → CSDN 返 521**(Cloudflare 限流),**521 ≠ 文章死**,只是被挡了。实测第一次过、之后全 521;误判成死亡就是又一次"假阴性"。
 
-**✅ 正确姿势(`czgts-auto/verify-anon2.js` 实测有效):**
-- **匿名访客视角**:直接用 **Node `fetch`**(天然不带 CSDN cookie = 真实访客),**不要**用登录 webview。
-- **加完整浏览器头**:`User-Agent` + `Accept-Language` + `Referer:https://www.csdn.net/` + `sec-ch-ua`,否则易被反爬。
-- **每篇间隔 6-15 秒**:CSDN 文章页是 SSR,正文 `#content_views` 直接在 HTML 里。慢速请求避 521。
-- **判活判据**:`HTTP 200 && HTML 含 id="content_views" && 正文纯文本 > 200 字 && 无"审核中/审核未通过"字样`。**判死**:`404` 或含"文章不存在/审核未通过"(实测被判违规的文章会变 404 下架)。
-- 遇 521 别当死亡 → 拉大间隔(15s)重测那几篇。
+**✅ 首选姿势: `listPublicArticles()` / `verifyAliveByList()`(已在引擎里)**
+
+CSDN 有个**匿名可读**的公开列表接口,一次请求就能拿到某账号的**全部公开文章 + 阅读数**:
+
+```js
+const list = await z.listPublicArticles('<账号名>');
+// [{articleId, title, url, postTime, viewCount, type}]  ——按发布时间倒序
+
+const v = await z.verifyAliveByList('<账号名>', ['164144107','164144198']);
+// {listed:3, alive:['164144107'], missing:['164144198'], articles:[...]}
+```
+
+接口 `https://blog.csdn.net/community/home-api/v1/get-business-list?page=1&size=20&businessType=blog&username=<账号>`。
+
+为什么它比逐篇 fetch 好:
+- **匿名**:用 Node 原生 `fetch` 不带 cookie = 真实访客视角,能被列出即公开存活(避开"登录态假 200")
+- **省请求**:一次拿全列表,20 篇以内只发 1 次请求 → 几乎不会触发 521;逐篇 fetch 20 篇要 20 次请求还得 sleep
+- **附带阅读数**:`viewCount` 直接可用,补 CSV 的阅读数列不用另外抓
+- 仍需完整浏览器头(`User-Agent` + `Accept-Language` + `Referer:https://blog.csdn.net/<账号>`),否则易被反爬
+
+⚠️ **`missing` ≠ 被删**:也可能是审核未通过(从未公开)或超出翻页范围。要区分"审核未通过 vs 已下架"只能读管理后台(见下)。
+⚠️ 返回空数组要区分"没文章"和"被限流":函数遇非 200 直接 break,所以空数组也可能是 521 —— 隔一会儿重试一次确认。
+
+**逐篇 fetch 文章页**(旧 `verify-anon2.js` 做法)仍可用于**单篇深查**:判活=`HTTP 200 && HTML 含 id="content_views" && 正文 > 200 字`;判死=`404`。但别用它做批量核实,慢且易 521。
 
 - `recordArticle()` 默认写 `%USERPROFILE%\czgts-published.csv`(可用 `CZGTS_CSV` 环境变量覆盖;字段=时间/账号/标题/公开链接/文章ID,按 articleId 幂等去重)。CSV 是"发布流水"≠"存活清单",核实后应补一列真实状态(正常公开/已下架)。
-- 定期核实: 用 `CronCreate` 跑 `verify-anon2.js` 全量匿名核对。
+- 定期核实: 用 `CronCreate` 跑 `verifyAliveByList()` 全量匿名核对。
 
 **⚠️ `publishBatch` 报 PUBLISHED ≠ 文章存活。** 2026-08-28 实测:20 篇全部 PUBLISHED,其中 **2 篇随后被判"审核未通过"**、匿名访问返 404、从未公开。publish 只能确认"提交成功",平台之后的判定它看不到。**每批发完必须核实**,别把 PUBLISHED 数当成存活数上报。
 

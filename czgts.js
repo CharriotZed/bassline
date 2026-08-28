@@ -377,6 +377,68 @@ async function checkAudit(c, account, articleId, titleSnippet) {
   return { passed: false, status: r.status, reason, url };
 }
 
+// 列出某账号的**全部公开文章**(匿名访客视角)。用 Node 原生 fetch 直连 CSDN 社区接口,
+// **不经 webview、不带任何 cookie** —— 所以返回的就是真实访客能看到的东西,能被列出即公开存活。
+// 这一点是它比 checkAudit 可靠的根本原因:checkAudit 在登录态里 fetch,作者 session 连草稿和
+// 被判违规的文章都返 200,分不清死活(见 SKILL.md 的"过审/存活核实")。
+//
+// 另一个优势是效率:一次请求拿全账号列表**并附带阅读数**,不用逐篇 fetch 文章页,也不容易触发 521。
+// 20 篇以内通常一页就够(size=20),超出才翻页;页间留 7s 间隔避 Cloudflare 限流。
+//
+// 返回 [{articleId, title, url, postTime, viewCount, type}](按接口返回顺序,通常是发布时间倒序)。
+// 账号不存在或被限流时返回空数组(不抛),调用方按 length===0 判断。
+async function listPublicArticles(account, { size = 20, maxPages = 20, gap = 7000 } = {}) {
+  const headers = {
+    // 完整浏览器头,否则易被反爬拦掉
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': `https://blog.csdn.net/${account}`,
+  };
+  const out = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `https://blog.csdn.net/community/home-api/v1/get-business-list`
+      + `?page=${page}&size=${size}&businessType=blog&username=${encodeURIComponent(account)}`;
+    let list;
+    try {
+      const resp = await fetch(url, { headers });
+      if (resp.status !== 200) break;   // 521=限流, 别当"没文章"
+      const j = await resp.json();
+      list = (j && j.data && j.data.list) || [];
+    } catch (e) { break; }
+    if (!list.length) break;
+    for (const a of list) {
+      out.push({
+        articleId: String(a.articleId || ''),
+        title: (a.title || '').trim(),
+        url: a.url || publicUrl(account, a.articleId),
+        postTime: a.postTime || a.formatTime || '',
+        viewCount: a.viewCount != null ? a.viewCount : '',
+        type: a.type || '',
+      });
+    }
+    if (list.length < size) break;      // 最后一页
+    await sleep(gap);
+  }
+  return out;
+}
+
+// 用公开列表核实一批 articleId 的存活状态(匿名视角, 一个账号只发 1-2 次请求)。
+// ids 省略则取该账号 CSV 里的全部记录。返回 {alive:[...], missing:[...], listed:N}
+// ⚠️ missing 不等于"被删":也可能是审核未通过(从未公开)或超出翻页范围。
+// 要区分"审核未通过 vs 已下架",只能读管理后台(见 SKILL.md)。
+async function verifyAliveByList(account, ids, opts = {}) {
+  const listed = await listPublicArticles(account, opts);
+  const live = new Set(listed.map(a => a.articleId));
+  const targets = (ids && ids.length) ? ids.map(String) : [...live];
+  return {
+    listed: listed.length,
+    alive: targets.filter(id => live.has(id)),
+    missing: targets.filter(id => !live.has(id)),
+    articles: listed,
+  };
+}
+
 // 默认CSV路径(和recordArticle一致)
 function defaultCsvPath() {
   return process.env.CZGTS_CSV || path.join(os.homedir(), 'czgts-published.csv');
@@ -660,6 +722,7 @@ module.exports = {
   readPort, portReachable, ensureRunning, listAccounts, connectPage, closePage,
   openNewDraft, fillArticle, saveDraft, verifyDraft, openPublishPanel, setCover, publish, sleep,
   publicUrl, checkAudit, recordArticle, notify,
+  listPublicArticles, verifyAliveByList,
   countPublishedToday, switchAccount, findWebviewByAccount, ensureTag, publishBatch,
   listPhones, discoverAccounts
 };
