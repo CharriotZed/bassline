@@ -19,21 +19,46 @@ const { chipFor } = require('./accounts-map');
 
 const args = process.argv.slice(2);
 
+// CSV 的字段是**带引号**的(`"2026/9/2 14:07:24","2601_x",...`),且标题里含中文逗号。
+// 直接 split(',') 会把引号留在值里 → new Date('"2026/9/2 14:07"') 是 Invalid Date,
+// 于是"今天发的文章"一篇都匹配不上(2026-09-02 实测踩到)。要真正解析引号。
+function parseCsvLine(line) {
+  const out = [];
+  let cur = '', inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else { inQ = false; }
+      } else cur += ch;
+    } else if (ch === '"') {
+      inQ = true;
+    } else if (ch === ',') {
+      out.push(cur); cur = '';
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+// "2026/9/2 14:07:24" → "2026-09-02"。不用 new Date():日期形如 2026/9/2,
+// 各平台/时区解析行为不一致,直接按字面拆更稳。
+function tsToIso(ts) {
+  const m = ts.trim().match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
+  if (!m) return null;
+  return m[1] + '-' + m[2].padStart(2, '0') + '-' + m[3].padStart(2, '0');
+}
+
 function fromCsv(dateStr) {
   const csv = process.env.CZGTS_CSV || path.join(os.homedir(), 'czgts-published.csv');
   const lines = fs.readFileSync(csv, 'utf8').split(/\r?\n/).filter(Boolean).slice(1);
   const byAcct = {};
   for (const line of lines) {
-    const cols = line.split(',');
+    const cols = parseCsvLine(line);
     const [ts, account, title] = cols;
     const aid = cols[4];
     if (!ts || !account || !aid) continue;
-    // CSV 时间形如 2026/9/1 14:40 —— 归一成 YYYY-MM-DD 再比
-    const d = new Date(ts.trim());
-    if (isNaN(d)) continue;
-    const iso = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0')
-      + '-' + String(d.getDate()).padStart(2, '0');
-    if (iso !== dateStr) continue;
+    if (tsToIso(ts) !== dateStr) continue;
     (byAcct[account] = byAcct[account] || []).push({ aid: aid.trim(), title: (title || '').trim() });
   }
   return byAcct;
