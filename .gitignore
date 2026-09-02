@@ -19,6 +19,12 @@ editor-dump.md
 # 账号映射(含真实手机号+CSDN账号, 绝不入库)
 accounts.json
 
+# 一次性批量发布/预检脚本(硬编码真实账号与chip手机号=PII;仓库是公开的)。
+# 批量发布走引擎的 publishBatch(),别把这类本地产物提交上来。
+publish-*.js
+prep-*.js
+!publish-batch-example.js
+
 # 编辑器 / 系统
 .vscode/
 .idea/
