@@ -606,24 +606,26 @@ async function ensureTag(c, tag) {
   }
 
   // 路径B:输入框手输 + 回车(输入框 placeholder="请输入文字搜索，Enter键入可添加自定义标签")
-  await c.send('DOM.enable');
-  const doc = await c.send('DOM.getDocument', { depth: -1 });
-  const { nodeIds } = await c.send('DOM.querySelectorAll', { nodeId: doc.root.nodeId, selector: 'input' });
-  for (const nid of nodeIds) {
-    const d = await c.send('DOM.describeNode', { nodeId: nid });
-    const attrs = (d.node.attributes || []).join(' ');
-    if (!/标签/.test(attrs)) continue;
-    // 只对可见输入框操作,否则又是静默落空
-    const box = await c.send('DOM.getBoxModel', { nodeId: nid }).catch(() => null);
-    if (!box) continue;
-    await c.send('DOM.focus', { nodeId: nid });
-    await c.send('Input.insertText', { text: tag });
-    await sleep(800);
-    await c.send('Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter' });
-    await c.send('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter' });
-    break;
-  }
-  await sleep(1200);
+  // ⚠️别用 DOM.focus + Input.insertText:这个输入框是 Vue 受控组件,insertText 打进去后
+  // `input.value` 仍是空串(2026-09-01实测),Enter 提交的是空串→标签永远加不上,且静默无报错。
+  // 必须用原生 value setter + 派发 input 事件让 Vue 收到变更,Enter 也用 KeyboardEvent 直接派发。
+  await c.eval(`(function(){
+    var i=[...document.querySelectorAll('input')].find(x=>(x.placeholder||'').indexOf('Enter键入')>=0 && x.offsetParent!==null);
+    if(!i) return 'no-input';
+    i.focus();
+    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set.call(i,${JSON.stringify(tag)});
+    i.dispatchEvent(new Event('input',{bubbles:true}));
+    return i.value;
+  })()`).catch(() => {});
+  await sleep(1500);
+  await c.eval(`(function(){
+    var i=[...document.querySelectorAll('input')].find(x=>(x.placeholder||'').indexOf('Enter键入')>=0 && x.offsetParent!==null);
+    if(!i) return;
+    ['keydown','keypress','keyup'].forEach(function(t){
+      i.dispatchEvent(new KeyboardEvent(t,{bubbles:true,cancelable:true,key:'Enter',code:'Enter',keyCode:13,which:13}));
+    });
+  })()`).catch(() => {});
+  await sleep(2000);
   tags = await c.eval(SELECTED_TAGS_JS).catch(() => []);
   if (tags.length) return tags;
 
