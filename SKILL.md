@@ -125,7 +125,7 @@ CSDN 有个**匿名可读**的公开列表接口,一次请求就能拿到某账�
 const list = await z.listPublicArticles('<账号名>');
 // [{articleId, title, url, postTime, viewCount, type}]  ——按发布时间倒序
 
-const v = await z.verifyAliveByList('<账号名>', ['164144107','164144198']);
+const v = await z.verifyAliveByList('<账号名>', ['<aid1>','<aid2>']);
 // {listed:3, alive:['164144107'], missing:['164144198'], articles:[...]}
 ```
 
@@ -200,7 +200,7 @@ const results = await P.promoteBatch([
 | **每日发文上限(平台配额)** | CSDN=每账号每天 2 篇, 发满后发布被静默拒绝。这是**平台规则非工具限制**——其他平台(抖音/B站/百家号等)各有配额, 发前按平台查 |
 | **配额在"提交"时扣, 不看审核结果** | 审核未通过的文章**照样占掉当天那个位置**, 不返还。所以一次被拒是**双倍损失**: 位置没了 + 什么都没发出去, 重写最早只能等次日配额。这决定了策略重心必须放在**发之前**(选题避开商业意图簇、正文守规则), 而不是"发出去再看, 不行就重写" |
 | 账号切前台 | 点主界面(czgts.cn)账号 chip, 非 CDP activateTarget |
-| chip 显示什么 | **不统一**:老号显示手机号(<手机号>),新号显示账号名(<账号名>)。`switchAccount` 按文本节点 includes 匹配,所以传谁取决于 chip 实际文本,两者都能点中 |
+| chip 显示什么 | **不统一**:老号显示**手机号**(11位),新号显示**账号名**(`2601_` 开头)。`switchAccount` 按文本节点 includes 匹配,所以传谁取决于 chip 实际文本,两者都能点中;用 `accounts-map.js` 的 `chipFor(account)` 解析(手机号只从 gitignored 的 accounts.json 读) |
 | 可用账号数 | **别按 accounts.json 推断**(它只维护了部分 phone→account 映射,照它算会漏掉只显示账号名的号)。发前 dump 一次 chip 实际文本:遍历 DOM 找自有文本匹配 `^1\d{10}$` 或 `^2601_\d+$` |
 | 流量券页 | `mp.csdn.net/mp_blog/manage/traffic`(标题"流量券列表")。**别猜 `/manage/coupon` 或 `/manage/promotion`**——都 404 |
 | "去使用"按钮 | `P.btn`(每张可用券一个; **是 `<p>` 不是 `<button>`**) |
